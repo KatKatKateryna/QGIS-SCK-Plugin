@@ -107,8 +107,9 @@ class SetupWorker(QThread):
 
             params = dict(self.params)
             location_only = bool(params.pop("location_only", False))
+            base_url = params.pop("base_url", None)
             session = authenix.load_session()
-            client = StaClient(session)
+            client = StaClient(session, base_url=base_url)
             if location_only:
                 config = client.update_publish_location(
                     params.get("config"),

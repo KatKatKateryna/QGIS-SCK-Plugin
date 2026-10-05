@@ -63,6 +63,7 @@ from .config import (
     SCK_PORT_KEY,
     SETTINGS_GROUP,
     STA_URL,
+    STA_URL_KEY,
     CHART_WINDOW_S,
     DISPLAY_NAME_KEY,
     MQTT_RECONNECT_BACKOFF,
@@ -87,7 +88,7 @@ from .mqtt import MqttConnectionError, MqttError, MqttPublisher, MqttUnauthorize
 from .publish import SetupWorker, apply_sample, observation_group_payload
 from .publish_dialog import PublishConsentDialog
 from .places import PlacesClickFilter, PlacesLayerStore, PlacesWorker
-from .sta import StaClient, StaError, grid_system_from_landing
+from .sta import StaClient, StaError, grid_system_from_landing, normalize_sta_base_url
 
 _logger = logging.getLogger("sck.plugin")
 
@@ -108,6 +109,18 @@ class SckDock(QDockWidget):
 
         self.status = QLabel()
         self.status.setWordWrap(True)
+        self.sta_url_edit = QLineEdit()
+        self.sta_url_edit.setPlaceholderText(STA_URL)
+        self.sta_url_edit.setText(self._initial_sta_url())
+        self.sta_url_edit.setToolTip(
+            "SensorThings base URL. A v1.0 ending is rewritten to v1.1. "
+            "MQTT host and port are read from that v1.1 landing page."
+        )
+        self.sta_url_edit.editingFinished.connect(lambda: self.plugin.commit_sta_url(notify=False))
+        self.validate_url_btn = QPushButton("Validate")
+        self.validate_url_btn.setToolTip(
+            "Check the SensorThings URL and log the MQTT domain and port from the v1.1 landing page."
+        )
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMinimumHeight(180)
@@ -169,6 +182,13 @@ class SckDock(QDockWidget):
         start_host_layout.addWidget(self.start_btn)
         action_row.addWidget(self.start_host)
         action_row.addWidget(self.stop_btn)
+        url_host = QWidget()
+        url_row = QHBoxLayout(url_host)
+        url_row.setContentsMargins(0, 0, 0, 0)
+        url_row.addWidget(self.sta_url_edit, 1)
+        url_row.addWidget(self.validate_url_btn)
+        service_row = QFormLayout()
+        service_row.addRow("SensorThings URL", url_host)
         name_row = QFormLayout()
         name_row.addRow("Name", self.name_edit)
         marker_row = QHBoxLayout()
@@ -186,6 +206,7 @@ class SckDock(QDockWidget):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.addWidget(self.status)
+        layout.addLayout(service_row)
         layout.addLayout(auth_row)
         layout.addLayout(action_row)
         layout.addWidget(self.publish_hint)
@@ -205,6 +226,7 @@ class SckDock(QDockWidget):
         layout.addWidget(self.log_view)
         self.setWidget(container)
 
+        self.validate_url_btn.clicked.connect(self.plugin.validate_sta_url)
         self.sign_in_btn.clicked.connect(self.plugin.sign_in)
         self.sign_out_btn.clicked.connect(self.plugin.sign_out)
         self.start_btn.clicked.connect(self.plugin.start_publishing)
@@ -242,6 +264,9 @@ class SckDock(QDockWidget):
             )
         else:
             self.status.setText("Not signed in. Sign in with AUTHENIX (QGIS OAuth2).")
+        url_locked = self.plugin.publishing or self.plugin.setup_busy()
+        self.sta_url_edit.setEnabled(not url_locked)
+        self.validate_url_btn.setEnabled(not url_locked)
         self.sign_in_btn.setEnabled(not usable or self.plugin.mqtt_needs_sign_in())
         self.sign_out_btn.setEnabled(signed_in)
         ready = (
@@ -401,6 +426,13 @@ class SckDock(QDockWidget):
             return
         self.foi_label.setText("%s (%s)" % (name, kind) if kind else name)
 
+    def _initial_sta_url(self):
+        """Normalized SensorThings URL for the text box (saved value, or the default)."""
+        try:
+            return normalize_sta_base_url(self.plugin._read_sta_url() or "")
+        except StaError:
+            return normalize_sta_base_url("")
+
 
 class SckPlugin:
     """QGIS plugin controller: registers the menu/toolbar action and owns the dock."""
@@ -479,19 +511,7 @@ class SckPlugin:
         self._sync_cursor_hint()
 
         log_info("STAplus SCK plugin loaded")
-        log_info("STA endpoint: %s" % STA_URL)
-        try:
-            client = StaClient()
-            landing = client.landing_page()
-            broker = client.mqtt_broker(landing)
-            log_info("MQTT broker from STA landing page: %s:%s (%s)" % (
-                broker["host"], broker["port"], broker["uri"]
-            ))
-            grid_system = grid_system_from_landing(landing)
-            if grid_system:
-                log_info("DGGS gridSystem from STA landing page: %s" % grid_system)
-        except Exception as err:
-            log_warning("Could not read MQTT endpoint from STA landing page: %s" % err)
+        self._probe_sta_landing()
         session = authenix.load_session() or {}
         if session.get("access_token"):
             user = session.get("user") or {}
@@ -634,6 +654,8 @@ class SckPlugin:
     def start_publishing(self):
         """Ask for Party name, license, and consent, then create Datastreams and start MQTT."""
         self.show_dock()
+        if not self.commit_sta_url():
+            return
         if self.publishing or self.setup_busy():
             return
         if not self.kit_connected or not self.kit_mac:
@@ -652,7 +674,7 @@ class SckPlugin:
             return
         try:
             session = authenix.ensure_fresh_session()
-            client = StaClient(session)
+            client = self._sta_client(session)
             licenses = client.list_template_licenses()
             party = client.find_party()
         except (authenix.AuthError, StaError) as err:
@@ -697,6 +719,7 @@ class SckPlugin:
             "foi_spec": self.selected_foi,
             "license_id": choices["license_id"],
             "attribution_text": choices["attribution_text"] if choices["needs_attribution"] else "",
+            "base_url": self.sta_base_url(),
         }
         self._stop_setup_worker()
         self.setup_worker = SetupWorker(params, self.iface.mainWindow())
@@ -742,7 +765,7 @@ class SckPlugin:
             host = self.publish_config.get("mqtt_host")
             port = self.publish_config.get("mqtt_port")
             if not host or not port:
-                broker = StaClient(session).mqtt_broker()
+                broker = self._sta_client(session).mqtt_broker()
                 host, port = broker["host"], broker["port"]
                 self.publish_config["mqtt_host"] = host
                 self.publish_config["mqtt_port"] = port
@@ -1294,6 +1317,119 @@ class SckPlugin:
         if worker.isRunning():
             worker.wait(3000)
 
+    def sta_base_url(self):
+        """SensorThings base URL from the dock, always ending in /v1.1."""
+        raw = ""
+        if self.dock is not None and hasattr(self.dock, "sta_url_edit"):
+            raw = self.dock.sta_url_edit.text()
+        if not str(raw or "").strip():
+            raw = self._read_sta_url() or ""
+        try:
+            return normalize_sta_base_url(raw)
+        except StaError:
+            try:
+                return normalize_sta_base_url(self._read_sta_url() or "")
+            except StaError:
+                return normalize_sta_base_url("")
+
+    def _sta_client(self, session=None):
+        """STAplus client for the dock URL (v1.0 is rewritten to v1.1)."""
+        return StaClient(session, base_url=self.sta_base_url())
+
+    def commit_sta_url(self, notify=True):
+        """Rewrite the SensorThings URL to v1.1 and save it. Return False when the text is not a URL."""
+        if self.dock is None or not hasattr(self.dock, "sta_url_edit"):
+            return False
+        edit = self.dock.sta_url_edit
+        try:
+            previous = normalize_sta_base_url(self._read_sta_url() or "")
+        except StaError:
+            previous = normalize_sta_base_url("")
+        try:
+            url = normalize_sta_base_url(edit.text())
+        except StaError as err:
+            if notify:
+                self._note(str(err), Qgis.MessageLevel.Warning)
+            return False
+        edit.blockSignals(True)
+        edit.setText(url)
+        edit.blockSignals(False)
+        self._save_sta_url(url)
+        if notify and url != previous:
+            self._note("SensorThings service set to %s" % url)
+        return True
+
+    def validate_sta_url(self):
+        """Rewrite the URL to v1.1, then log the MQTT domain and port from the landing page."""
+        self.show_dock()
+        if not self.commit_sta_url():
+            return
+        url = self.sta_base_url()
+        self._note("Checking SensorThings service %s…" % url)
+        try:
+            client = self._sta_client()
+            landing = client.landing_page()
+            broker = client.mqtt_broker(landing)
+        except Exception as err:
+            self._note(
+                "SensorThings URL is not usable: %s" % err,
+                Qgis.MessageLevel.Warning,
+            )
+            return
+        self._note(
+            "SensorThings URL is valid. MQTT domain %s, port %s."
+            % (broker["host"], broker["port"]),
+            Qgis.MessageLevel.Success,
+        )
+
+    def _probe_sta_landing(self, announce=False):
+        """GET the v1.1 root document and log MQTT domain and port from the create-observations key."""
+        url = self.sta_base_url()
+        log_info("STA endpoint: %s" % url)
+        try:
+            client = self._sta_client()
+            landing = client.landing_page()
+            broker = client.mqtt_broker(landing)
+            message = "MQTT broker from STA v1.1 landing page: %s:%s (%s)" % (
+                broker["host"],
+                broker["port"],
+                broker["uri"],
+            )
+            log_info(message)
+            if announce and self.dock is not None:
+                self.dock.append_log(message)
+            grid_system = grid_system_from_landing(landing)
+            if grid_system:
+                log_info("DGGS gridSystem from STA landing page: %s" % grid_system)
+        except Exception as err:
+            log_warning("Could not read MQTT endpoint from STA v1.1 landing page: %s" % err)
+            if announce:
+                self._note(
+                    "Could not read MQTT host and port from %s: %s" % (url, err),
+                    Qgis.MessageLevel.Warning,
+                )
+
+    def _read_sta_url(self):
+        """Last SensorThings base URL stored under SETTINGS_GROUP."""
+        settings = QgsSettings()
+        settings.beginGroup(SETTINGS_GROUP)
+        try:
+            return str(settings.value(STA_URL_KEY) or "").strip() or None
+        finally:
+            settings.endGroup()
+
+    def _save_sta_url(self, url):
+        """Remember the SensorThings base URL (already normalized to v1.1)."""
+        settings = QgsSettings()
+        settings.beginGroup(SETTINGS_GROUP)
+        try:
+            if url:
+                settings.setValue(STA_URL_KEY, str(url))
+            else:
+                settings.remove(STA_URL_KEY)
+        finally:
+            settings.endGroup()
+
     def _read_sck_port(self):
         """Last serial device path stored under SETTINGS_GROUP."""
         settings = QgsSettings()
@@ -1474,6 +1610,7 @@ class SckPlugin:
             "lat": self.lat,
             "lon": self.lon,
             "location_name": self.sta_location_name(),
+            "base_url": self.sta_base_url(),
         }
         self._stop_setup_worker()
         self.setup_worker = SetupWorker(params, self.iface.mainWindow())
@@ -1683,7 +1820,7 @@ class SckPlugin:
         """Create or reuse the selected (or unset) FeatureOfInterest on STAplus."""
         try:
             session = authenix.ensure_fresh_session()
-            client = StaClient(session)
+            client = self._sta_client(session)
             foi = client.ensure_feature_of_interest(self.selected_foi)
             pretty = json.dumps(
                 {

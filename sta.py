@@ -17,6 +17,7 @@
 
 import json
 import logging
+import re
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -39,9 +40,18 @@ from .h3cell import latlng_to_cell
 
 _logger = logging.getLogger("sck.sta")
 
+# Path segment .../v1.0 or .../v1.1, possibly followed by more path.
+_STA_VERSION_SEGMENT = re.compile(r"/v1\.[01](?=/|$)", re.IGNORECASE)
+
 
 class StaError(RuntimeError):
     """Raised when a STAplus HTTP request fails or returns an error status."""
+
+    def __init__(self, message, status_code=None, location=None, body=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.location = location
+        self.body = body
 
 
 def is_template_license(entity):
@@ -65,6 +75,37 @@ def is_attribution_license(entity):
     return False
 
 
+def normalize_sta_base_url(url):
+    """Return a SensorThings base URL that always ends with /v1.1.
+
+    The dock may contain a service root ending in v1.0 or v1.1. Requests and
+    the MQTT lookup always use the v1.1 landing page. A missing version is
+    appended. Anything after the version segment is dropped.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return STA_URL.rstrip("/")
+    if "://" not in text:
+        text = "https://" + text.lstrip("/")
+    parsed = urlparse(text)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or any(ch.isspace() for ch in parsed.hostname)
+    ):
+        raise StaError(
+            "SensorThings URL must be an http or https address, for example %s."
+            % STA_URL
+        )
+    path = parsed.path or ""
+    match = _STA_VERSION_SEGMENT.search(path)
+    if match:
+        path = path[: match.start()] + "/v1.1"
+    else:
+        path = path.rstrip("/") + "/v1.1"
+    return "%s://%s%s" % (parsed.scheme, parsed.netloc, path)
+
+
 def parse_mqtt_endpoint(uri):
     """Parse mqtt://host:port from a SensorThings landing-page endpoint URI."""
     parsed = urlparse(str(uri or "").strip())
@@ -81,25 +122,26 @@ def parse_mqtt_endpoint(uri):
 
 
 def mqtt_broker_from_landing(landing):
-    """MQTT broker advertised under create-observations-via-mqtt on the STA root document."""
+    """MQTT host and port from the v1.1 landing page create-observations-via-mqtt key."""
     settings = (landing or {}).get("serverSettings") or {}
-    endpoints = []
     block = settings.get(MQTT_CREATE_SPEC)
+    endpoints = []
     if isinstance(block, dict):
-        endpoints = list(block.get("endpoints") or [])
-    if not endpoints:
-        for value in settings.values():
-            if not isinstance(value, dict):
-                continue
-            for item in value.get("endpoints") or []:
-                if isinstance(item, str) and item.lower().startswith("mqtt"):
-                    endpoints.append(item)
+        raw = block.get("endpoints")
+        if isinstance(raw, str):
+            endpoints = [raw]
+        elif isinstance(raw, (list, tuple)):
+            endpoints = list(raw)
+    elif isinstance(block, str):
+        endpoints = [block]
+    elif isinstance(block, (list, tuple)):
+        endpoints = list(block)
     for endpoint in endpoints:
         parsed = parse_mqtt_endpoint(endpoint)
         if parsed:
             return parsed
     raise StaError(
-        "STAplus landing page has no MQTT endpoint under %s" % MQTT_CREATE_SPEC
+        "STAplus v1.1 landing page has no MQTT endpoint under %s" % MQTT_CREATE_SPEC
     )
 
 
@@ -132,8 +174,11 @@ class StaClient:
     """Authenticated SensorThings / STAplus client. HTTP 401 tells the user to click Sign in."""
 
     def __init__(self, session=None, base_url=STA_URL):
-        """session must contain access_token from authenix (browser PKCE login)."""
-        self.base_url = base_url.rstrip("/") + "/"
+        """session must contain access_token from authenix (browser PKCE login).
+
+        base_url may end with v1.0 or v1.1; the client always calls v1.1.
+        """
+        self.base_url = normalize_sta_base_url(base_url).rstrip("/") + "/"
         self.session = dict(session or authenix.load_session() or {})
         self._http = requests.Session()
         self._http.trust_env = False
@@ -144,7 +189,7 @@ class StaClient:
         return self.session.get("access_token") or ""
 
     def _headers(self, authenticate=True):
-        """JSON Accept. Bearer is only for writes; STAplus reads are public."""
+        """JSON Accept. Bearer is sent for writes and for every Party request."""
         headers = {"Accept": "application/json"}
         if authenticate:
             token = self.access_token()
@@ -153,9 +198,15 @@ class StaClient:
         return headers
 
     def request(self, method, path, payload=None, params=None, authenticate=None):
-        """Send one STAplus request. GET/HEAD are unauthenticated; writes send Bearer."""
+        """Send one STAplus request.
+
+        GET/HEAD are unauthenticated, except Party, which always sends the access token.
+        Writes send Bearer.
+        """
         method = method.upper()
-        if authenticate is None:
+        if _is_party_path(path):
+            authenticate = True
+        elif authenticate is None:
             authenticate = method not in ("GET", "HEAD", "OPTIONS")
         href = path if path.startswith("http") else urljoin(self.base_url, path.lstrip("/"))
         kwargs = {
@@ -184,10 +235,16 @@ class StaClient:
             )
 
         if response.status_code >= 400:
+            location = (
+                response.headers.get("Location") or response.headers.get("location") or ""
+            ).strip() or None
             raise StaError(
                 _format_http_error(
                     response, href, self.access_token() if authenticate else "", payload
-                )
+                ),
+                status_code=response.status_code,
+                location=location,
+                body=response.text,
             )
         if response.status_code == 204 or not (response.text or "").strip():
             return _entity_from_location_header(response) or {}
@@ -196,9 +253,13 @@ class StaClient:
         except ValueError:
             return {"raw": response.text}
 
-    def get(self, path, params=None):
-        """GET a STAplus collection or entity. Reads do not send a Bearer token."""
-        return self.request("GET", path, params=params)
+    def get(self, path, params=None, authenticate=False):
+        """GET a STAplus collection or entity.
+
+        Reads are public by default. Party requests always send the access token.
+        Pass authenticate=True for any other read that depends on the signed-in user.
+        """
+        return self.request("GET", path, params=params, authenticate=authenticate)
 
     def post(self, path, payload):
         """POST a new STAplus entity (Bearer required)."""
@@ -468,38 +529,59 @@ class StaClient:
         return config
 
     def _ensure_party(self, display_name, sub):
-        """Return the Party for this AUTHENIX subject, creating it if STAplus has none yet."""
+        """Return the Party for this AUTHENIX subject, creating it if STAplus has none yet.
+
+        HTTP 409 on create means this user already has a Party. Load that Party and continue.
+        """
         display_name = (display_name or "").strip() or "QGIS SCK user"
-        if sub:
-            found = self._query("Parties", "authId eq %s" % _odata_quote(sub))
-            if found:
-                party = found[0]
-                _logger.info("Reusing Party @iot.id=%s authId=%s", party.get("@iot.id"), sub)
-                if display_name and party.get("displayName") != display_name:
-                    self.patch(_entity_path("Parties", party.get("@iot.id")), {"displayName": display_name})
-                    party["displayName"] = display_name
-                    _logger.info("Updated Party displayName=%s", display_name)
+        party = self._party_for_subject(sub)
+        if party is None:
+            payload = {
+                "description": "Acting user of the STAplus SCK QGIS plugin",
+                "displayName": display_name,
+                "role": "individual",
+            }
+            try:
+                party = self.post("Parties", payload)
+            except StaError as err:
+                _logger.info(
+                    "Party already exists (HTTP 409); reusing @iot.id=%s authId=%s",
+                    party.get("@iot.id"),
+                    sub,
+                )
+            else:
+                _logger.info(
+                    "Created Party @iot.id=%s displayName=%s authId=%s",
+                    party.get("@iot.id"),
+                    party.get("displayName"),
+                    party.get("authId"),
+                )
                 return party
-        payload = {
-            "description": "Acting user of the STAplus SCK QGIS plugin",
-            "displayName": display_name,
-            "role": "individual",
-        }
-        party = self.post("Parties", payload)
-        _logger.info(
-            "Created Party @iot.id=%s displayName=%s authId=%s",
-            party.get("@iot.id"),
-            party.get("displayName"),
-            party.get("authId"),
-        )
+        else:
+            _logger.info("Reusing Party @iot.id=%s authId=%s", party.get("@iot.id"), sub)
+        if display_name and party.get("displayName") != display_name:
+            self.patch(_entity_path("Parties", party.get("@iot.id")), {"displayName": display_name})
+            party["displayName"] = display_name
+            _logger.info("Updated Party displayName=%s", display_name)
         return party
 
     def find_party(self):
         """Party for the current AUTHENIX subject, or None."""
         sub = (self.session.get("user") or {}).get("sub") or ""
+        return self._party_for_subject(sub)
+
+    def _party_for_subject(self, sub):
+        """Party whose authId is this AUTHENIX subject, or None.
+
+        The lookup sends the access token. The service uses it to resolve this user's Party.
+        """
         if not sub:
             return None
-        found = self._query("Parties", "authId eq %s" % _odata_quote(sub))
+        found = self._query(
+            "Parties",
+            "authId eq me()",
+            authenticate=True,
+        )
         return found[0] if found else None
 
     def list_template_licenses(self):
@@ -746,13 +828,13 @@ class StaClient:
         )
         return foi
 
-    def _query(self, collection, filter_expr, expand=None, top=5):
+    def _query(self, collection, filter_expr, expand=None, top=5, authenticate=False):
         """OData $filter lookup; returns [] if the query fails so callers can fall back to create."""
         params = {"$filter": filter_expr, "$top": str(top)}
         if expand:
             params["$expand"] = expand
         try:
-            data = self.get(collection, params=params)
+            data = self.get(collection, params=params, authenticate=authenticate)
         except StaError as err:
             _logger.warning("Query %s failed: %s", collection, err)
             return []
@@ -850,6 +932,20 @@ def _iot_id_from_self_link(url):
     return raw or None
 
 
+def _entity_from_conflict_body(body):
+    """Party entity when a 409 body is that entity, otherwise None."""
+    text = (body or "").strip()
+    if not text or text[0] not in "{[":
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and data.get("@iot.id") is not None:
+        return data
+    return None
+
+
 def _entity_from_location_header(response):
     """FROST 201 may return an empty body plus a Location header with the new @iot.id."""
     href = (response.headers.get("Location") or response.headers.get("location") or "").strip()
@@ -860,6 +956,15 @@ def _entity_from_location_header(response):
     if iot_id is not None:
         entity["@iot.id"] = iot_id
     return entity
+
+
+def _is_party_path(path):
+    """True when the URL addresses the Parties collection or one Party."""
+    text = str(path or "").split("?")[0].rstrip("/")
+    for segment in text.split("/"):
+        if segment == "Parties" or segment.startswith("Parties("):
+            return True
+    return False
 
 
 def _odata_quote(value):

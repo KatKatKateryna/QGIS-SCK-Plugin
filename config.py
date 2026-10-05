@@ -16,7 +16,9 @@
 """Plugin constants: STAplus endpoint, MQTT broker, and AUTHENIX / QGIS OAuth2 settings."""
 
 STA_URL = "https://citiobs.demo.secure-dimensions.de/stapluscelltest/v1.1"
-# MQTT host/port come from the STA landing page (create-observations-via-mqtt endpoints).
+# Last SensorThings base URL from the dock (always stored as .../v1.1).
+STA_URL_KEY = "sta_url"
+# MQTT host/port come from the v1.1 landing page under this serverSettings key.
 MQTT_CREATE_SPEC = (
     "http://www.opengis.net/spec/iot_sensing/1.1/req/create-observations-via-mqtt/"
     "observations-creation"
