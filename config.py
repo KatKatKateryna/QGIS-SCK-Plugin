@@ -23,7 +23,8 @@ MQTT_CREATE_SPEC = (
     "http://www.opengis.net/spec/iot_sensing/1.1/req/create-observations-via-mqtt/"
     "observations-creation"
 )
-DGGS_CORE_SPEC = "http://www.opengis.net/spec/sensorthings-dggs/1.0/conf/core"
+DGGS_CORE_SPEC = "http://www.opengis.net/spec/sensorthings-dggs/1.0/conf/cell"
+DGGS_GRID_SYSTEM = "http://www.opengis.net/spec/sensorthings-dggs/1.0/req/grid-system"
 # H3 cell for a Datastream is the hex index at this resolution (marker location).
 H3_CELL_RESOLUTION = 9
 

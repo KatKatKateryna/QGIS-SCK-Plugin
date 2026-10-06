@@ -27,6 +27,7 @@ from .catalog import DATASTREAMS, OBSERVED_PROPERTIES, OM_MEASUREMENT, SENSORS
 from .config import (
     DEFAULT_LOCATION_NAME,
     DGGS_CORE_SPEC,
+    DGGS_GRID_SYSTEM,
     ELEVATION_API_URL,
     H3_CELL_RESOLUTION,
     MARKER_COORD_EPS,
@@ -148,7 +149,7 @@ def mqtt_broker_from_landing(landing):
 def grid_system_from_landing(landing):
     """DGGS gridSystem from serverSettings under sensorthings-dggs core, or None."""
     settings = (landing or {}).get("serverSettings") or {}
-    block = settings.get(DGGS_CORE_SPEC)
+    block = settings.get(DGGS_GRID_SYSTEM)
     if isinstance(block, dict):
         grid = str(block.get("gridSystem") or "").strip()
         if grid:
