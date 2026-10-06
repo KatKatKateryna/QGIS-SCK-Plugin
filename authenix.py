@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 import zlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -667,8 +667,6 @@ def _loopback_handler(result):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        # Browsers open idle preconnect sockets; do not wait on them forever.
-        timeout = 5
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -705,18 +703,12 @@ def _loopback_handler(result):
 
 
 def _http_server(host, port, handler):
-    """Threaded HTTPServer bound to IPv4 or IPv6 loopback.
-
-    Threaded so an idle browser preconnect cannot block the redirect request or
-    make shutdown() hang the QGIS GUI thread.
-    """
+    """HTTPServer bound to IPv4 or IPv6 loopback."""
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
 
-    class Server(ThreadingHTTPServer):
+    class Server(HTTPServer):
         address_family = family
         allow_reuse_address = True
-        daemon_threads = True
-        block_on_close = False
 
         def server_bind(self):
             if family == socket.AF_INET6 and hasattr(socket, "IPPROTO_IPV6"):
@@ -724,7 +716,7 @@ def _http_server(host, port, handler):
                     self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 except OSError:
                     pass
-            ThreadingHTTPServer.server_bind(self)
+            HTTPServer.server_bind(self)
 
     return Server((host, port), handler)
 
