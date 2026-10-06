@@ -83,9 +83,15 @@ Plugin messages appear in the dock log and under **Log Messages → STAplus SCK*
 ## Error Handling
 The plugin authentication is using the QGIS OpenID Connect and a callback to `localhost:7070`. This is the standard QGIS authentication behavior and cannot be changed. In order for this callback to work, the QGIS application must be able to start a Web Server on port `7070`. 
 
-An error will be raised by the operating system if the port `7070` is already used by another application (see screenshot below as an example). You need to quit the application that uses the port `7070`. In case you don't know which application is using port `7070` , you can use the Windows PowerShell with the following command:
+An error will be raised by the operating system if the port `7070` is already used by another application (see screenshot below as an example). 
 
 ![Windows Exception](./windows-error.jpg)
+
+You need to quit the application that uses the port `7070`. In case you don't know which application is using port `7070` , you can use the Windows PowerShell with the following command:
+
+```sh
+netstat -ano -p tcp | findstr ":7070"
+```
 
 And then you can find the application using the `<process id>` returned from the previous command.
 
